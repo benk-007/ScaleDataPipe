@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Pipeline runtime data (outputs, Spark checkpoints, metastore)
+data/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Original Colab material (contains leaked keys / public share link)
+*.ipynb
+*.pdf
+
+# macOS / exFAT metadata
+.DS_Store
+._*
+
+# IDE
+.idea/
+.vscode/
