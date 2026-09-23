@@ -1,11 +1,9 @@
-# Python 3.10 or 3.11 (PySpark 3.5 does not officially support 3.12+)
-# Java 17 required by Spark.
+# Local development: Python 3.10 or 3.11 (PySpark 3.5 does not officially
+# support 3.12+) and Java 17.
 
 # PySpark 3.5.1 ships Scala 2.12 jars: the Kafka connector is resolved
 # automatically as org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
-# (see scaledatapipe/common/spark.py). Change both together, never one alone.
+# (see scaledatapipe/common/spark.py). Keep in sync with docker/spark/Dockerfile.
 pyspark==3.5.1
 
-kafka-python==2.2.0
-requests==2.32.3
-python-dotenv==1.0.1
+-r requirements-base.txt

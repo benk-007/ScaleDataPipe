@@ -1,0 +1,12 @@
+# Keep secrets and local artefacts out of the build context
+.env
+.env.*
+.git
+.venv
+venv
+data
+**/__pycache__
+**/._*
+**/.DS_Store
+*.ipynb
+*.pdf

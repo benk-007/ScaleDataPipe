@@ -1,0 +1,5 @@
+# Runtime dependencies shared by the local venv and the Docker image.
+# (The Docker image gets PySpark from the Spark distribution itself.)
+kafka-python==2.2.0
+requests==2.32.3
+python-dotenv==1.0.1

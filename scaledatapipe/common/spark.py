@@ -1,5 +1,6 @@
 """Spark helpers shared by all consumers."""
 import argparse
+import os
 import re
 from pathlib import Path
 
@@ -11,25 +12,37 @@ from pyspark.sql.types import StructType
 from scaledatapipe.common import config
 
 
-def kafka_package() -> str:
-    """Kafka connector coordinates matching the installed PySpark.
+def _spark_jars_dir() -> Path:
+    candidates = [Path(pyspark.__file__).parent / "jars"]
+    if os.getenv("SPARK_HOME"):
+        candidates.insert(0, Path(os.environ["SPARK_HOME"]) / "jars")
+    for jars in candidates:
+        if any(jars.glob("scala-library-*.jar")):
+            return jars
+    raise RuntimeError(f"Spark jars directory not found in {candidates}")
 
-    Derived from the Scala library bundled with PySpark, so the connector can
+
+def kafka_package() -> str | None:
+    """Kafka connector coordinates matching the running Spark, or None if the
+    connector is already on the classpath (as in the Docker image).
+
+    Derived from the Scala library bundled with Spark, so the connector can
     never drift from the Spark/Scala version actually running.
     """
-    jars = Path(pyspark.__file__).parent / "jars"
+    jars = _spark_jars_dir()
+    if any(jars.glob("spark-sql-kafka-0-10_*.jar")):
+        return None
     scala_jar = next(jars.glob("scala-library-*.jar"))
     scala_binary = re.match(r"scala-library-(\d+\.\d+)", scala_jar.name).group(1)
     return f"org.apache.spark:spark-sql-kafka-0-10_{scala_binary}:{pyspark.__version__}"
 
 
 def get_spark(app_name: str) -> SparkSession:
-    spark = (
-        SparkSession.builder.appName(app_name)
-        .config("spark.jars.packages", kafka_package())
-        .config("spark.sql.shuffle.partitions", "4")
-        .getOrCreate()
-    )
+    builder = SparkSession.builder.appName(app_name).config("spark.sql.shuffle.partitions", "4")
+    package = kafka_package()
+    if package:
+        builder = builder.config("spark.jars.packages", package)
+    spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     return spark
 

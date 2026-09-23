@@ -28,18 +28,24 @@ TOPICS = [TOPIC_COVID, TOPIC_WEATHER, TOPIC_SPORT, TOPIC_CYBER]
 STARTING_OFFSETS = _env("STARTING_OFFSETS", "earliest")
 TRIGGER_INTERVAL = _env("TRIGGER_INTERVAL", "5 seconds")
 
-# Outputs and checkpoints (one folder per domain)
-DATA_ROOT = Path(_env("DATA_ROOT", str(REPO_ROOT / "data"))).expanduser()
-if not DATA_ROOT.is_absolute():
-    DATA_ROOT = (REPO_ROOT / DATA_ROOT).resolve()
+# Outputs and checkpoints (one folder per domain).
+# Either a local path or a URI such as hdfs://namenode:8020/scaledatapipe
+def _resolve_data_root(value: str) -> str:
+    if "://" in value:
+        return value.rstrip("/")
+    path = Path(value).expanduser()
+    return str(path if path.is_absolute() else (REPO_ROOT / path).resolve())
+
+
+DATA_ROOT = _resolve_data_root(_env("DATA_ROOT", str(REPO_ROOT / "data")))
 
 
 def output_path(domain: str) -> str:
-    return str(DATA_ROOT / "outputs" / domain)
+    return f"{DATA_ROOT}/outputs/{domain}"
 
 
 def checkpoint_path(domain: str) -> str:
-    return str(DATA_ROOT / "checkpoints" / domain)
+    return f"{DATA_ROOT}/checkpoints/{domain}"
 
 
 # External sources
