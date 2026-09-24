@@ -38,7 +38,11 @@ def kafka_package() -> str | None:
 
 
 def get_spark(app_name: str) -> SparkSession:
-    builder = SparkSession.builder.appName(app_name).config("spark.sql.shuffle.partitions", "4")
+    builder = (
+        SparkSession.builder.appName(app_name)
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.sql.session.timeZone", "UTC")
+    )
     package = kafka_package()
     if package:
         builder = builder.config("spark.jars.packages", package)
@@ -84,6 +88,18 @@ def start(df: DataFrame, domain: str, process_batch, available_now: bool):
         writer = writer.trigger(processingTime=config.TRIGGER_INTERVAL)
     query = writer.start()
     query.awaitTermination()
+
+
+def _hadoop_path(spark: SparkSession, path: str):
+    jvm = spark.sparkContext._jvm
+    hpath = jvm.org.apache.hadoop.fs.Path(path)
+    return hpath.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration()), hpath
+
+
+def path_exists(spark: SparkSession, path: str) -> bool:
+    """Existence check on any Hadoop filesystem (local or hdfs://)."""
+    fs, hpath = _hadoop_path(spark, path)
+    return fs.exists(hpath)
 
 
 def append_csv(batch_df: DataFrame, domain: str) -> None:

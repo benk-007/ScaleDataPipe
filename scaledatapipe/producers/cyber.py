@@ -13,7 +13,17 @@ def fetch_events() -> list[dict]:
     r.raise_for_status()
     date = today()
     return [
-        {"date": date, "source": "cisa_kev", "cve": v.get("cveID", "")}
+        {
+            "date": date,
+            "source": "cisa_kev",
+            "cve": v.get("cveID", ""),
+            "vendor": v.get("vendorProject"),
+            "product": v.get("product"),
+            "vulnerability_name": v.get("vulnerabilityName"),
+            "date_added": v.get("dateAdded"),
+            "due_date": v.get("dueDate"),
+            "known_ransomware_use": v.get("knownRansomwareCampaignUse"),
+        }
         for v in r.json().get("vulnerabilities", [])[:MAX_EVENTS]
     ]
 

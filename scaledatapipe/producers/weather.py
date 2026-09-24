@@ -36,6 +36,9 @@ def fetch_events() -> list[dict]:
                     "temperature": float(curr["temperature_2m"]),
                     "humidity": float(curr["relative_humidity_2m"]),
                     "wind_speed": float(curr["wind_speed_10m"]),
+                    "observed_at": curr["time"],  # UTC (Open-Meteo default timezone)
+                    "latitude": loc["lat"],
+                    "longitude": loc["lon"],
                 }
             )
         except (requests.RequestException, KeyError, ValueError) as e:

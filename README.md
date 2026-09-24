@@ -1,7 +1,8 @@
 # ScaleDataPipe
 
 Real-time data pipeline: Python producers pull four public sources into Apache Kafka,
-and Spark Structured Streaming consumers process each topic.
+and a Spark Structured Streaming job lands them in a Medallion lake on HDFS
+(Bronze raw copy -> Silver typed, validated and deduplicated tables).
 
 | Domain  | Source                                   | Kafka topic     |
 |---------|------------------------------------------|-----------------|
@@ -10,9 +11,8 @@ and Spark Structured Streaming consumers process each topic.
 | Sport   | [football-data.org](https://www.football-data.org) (key) | `sport_topic` |
 | Cyber   | [CISA KEV feed](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | `cyber_topic` |
 
-> Work in progress: Medallion storage (Bronze/Silver/Gold) and Airflow
-> orchestration are the next milestones. Consumers currently write CSV files,
-> to HDFS when run on the cluster, or locally from a venv.
+> Work in progress: the Gold layer (business aggregates) and Airflow
+> orchestration are the next milestones.
 
 ## Layout
 
@@ -22,16 +22,52 @@ scaledatapipe/
 │   ├── config.py     # all settings, from environment / .env
 │   └── spark.py      # SparkSession, Kafka source, streaming helpers
 ├── producers/        # covid.py, weather.py, sport.py, cyber.py (one-shot)
-└── consumers/        # covid.py, weather.py, sport.py, cyber.py (streaming)
+├── medallion/
+│   ├── bronze.py     # Kafka -> Bronze (raw records + Kafka coordinates)
+│   ├── silver.py     # Bronze -> Silver / quarantine, per-domain rules
+│   └── run.py        # streaming entry point (both layers, supervised)
+└── consumers/        # legacy per-topic CSV consumers (replaced by Gold in Lot 4)
 scripts/
 ├── create_topics.py  # idempotent topic creation
-└── check_topics.py   # message count + sample per topic
+├── check_topics.py   # message count + sample per topic
+└── lake_report.py    # row counts and reject reasons per lake table
+tests/                # Silver rules, typing and dedup (local Spark)
 docker/
 ├── spark/Dockerfile  # Spark 3.5.1 + baked-in Kafka connector + app code
 ├── spark/submit.sh   # spark-submit wrapper for the standalone cluster
 └── hadoop.env        # HDFS configuration
 docker-compose.yml
 ```
+
+## Data lake layout
+
+Everything lives under `DATA_ROOT` (`hdfs://namenode:8020/scaledatapipe` in Docker).
+
+| Table                    | Content                                                     | Partitions              |
+|--------------------------|-------------------------------------------------------------|-------------------------|
+| `bronze/events`          | every Kafka record, untouched JSON + topic/partition/offset | `topic`, `ingest_date`  |
+| `silver/<domain>`        | typed business columns + Kafka lineage, deduplicated        | `event_date`            |
+| `quarantine/<domain>`    | rows failing validation: raw value + `reject_reason`        | `ingest_date`           |
+| `checkpoints/<query>`    | Structured Streaming state                                  |                         |
+
+- **Bronze** is append-only and exactly-once (Parquet file sink + checkpoint), so
+  every downstream table can be rebuilt from it.
+- **Silver** parses each topic with an explicit schema, types the columns
+  (UTC timestamps, dates, numbers), applies per-domain rules and drops duplicate
+  business keys. Every Bronze record ends up either in Silver or in quarantine,
+  never silently dropped (duplicates excepted).
+
+| Domain  | Business key (dedup)                         | Rejected when                                               |
+|---------|----------------------------------------------|-------------------------------------------------------------|
+| covid   | `article_id` (hash of URL, or title)         | no title, no date                                           |
+| weather | `city`, `observed_at`                        | no city/time, temperature, humidity or wind out of range    |
+| sport   | `match_id`, `status`, scores                 | no id/kickoff/team, unknown status, finished without score  |
+| cyber   | `cve_id`                                     | malformed CVE id, no `date_added`                           |
+
+Silver deduplicates within `SILVER_DEDUP_WINDOW` (default 7 days) of the first
+occurrence, which keeps streaming state bounded; Gold will deduplicate fully.
+Sport keys include status and score so a match's progression (TIMED -> FINISHED)
+is kept.
 
 ## Run with Docker (recommended)
 
@@ -43,6 +79,7 @@ docker-compose.yml
 | `datanode`     | HDFS DataNode                          |                        |
 | `spark-master` | Spark 3.5.1 standalone master          | http://localhost:8080  |
 | `spark-worker` | Spark worker (2 cores, 1.5 GB)         |                        |
+| `streaming`    | Medallion job: Kafka -> Bronze -> Silver, always on |           |
 | `app`          | one-off tools container (profile `tools`) |                     |
 
 ```bash
@@ -53,19 +90,36 @@ docker compose up -d --build          # not --wait: kafka-init is a one-shot job
 docker compose run --rm app python3 -m scaledatapipe.producers.covid   # likewise weather, sport, cyber
 docker compose run --rm app python3 -m scripts.check_topics
 
-# Consumers on the Spark cluster -> HDFS (hdfs://namenode:8020/scaledatapipe)
-docker compose run --rm app submit scaledatapipe/consumers/covid.py --available-now
-docker compose exec namenode hdfs dfs -ls -R /scaledatapipe/outputs
+# The streaming service picks the events up within seconds
+docker compose run --rm app submit scripts/lake_report.py
+docker compose exec namenode hdfs dfs -ls /scaledatapipe/silver
 
 docker compose down        # keeps Kafka and HDFS data (add -v to wipe it)
 ```
 
-`app` waits until the topics exist and HDFS has left safe mode. The Kafka
+`app` waits until the topics exist and HDFS has left safe mode.
+
+The streaming job is supervised: a failing query, or a cluster lost for more than
+`EXECUTOR_GRACE_SECONDS` (default 120), stops it and Docker restarts it; it then
+resumes from its checkpoints. Compose also restarts it whenever it restarts the
+Spark master. After rebuilding the image, run `docker compose up -d` so every
+service picks it up.
+
+To process the lake in batch instead (e.g. to rebuild it), stop the service first:
+two jobs must never share the same checkpoints.
+
+```bash
+docker compose stop streaming
+docker compose run --rm app submit scaledatapipe/medallion/run.py --available-now
+docker compose start streaming
+``` The Kafka
 connector jars are part of the image (checksum-pinned), so jobs never download
 from Maven at runtime. API keys come from `.env` at run time and are never
 copied into the image (see `.dockerignore`).
 
-Resources: about 1.6 GB of RAM at idle, plus about 1 GB per running job. The
+Resources: about 1.6 GB of RAM for the infrastructure, plus about 1.5 GB for the
+streaming job; each Spark app takes 1 core and 768 MB of executor memory, so one
+more job can run next to it. The
 HDFS images are amd64-only and run emulated on Apple Silicon, which is slower
 to start but works.
 
@@ -80,13 +134,19 @@ docker compose up -d kafka kafka-init
 
 python -m scaledatapipe.producers.covid                  # likewise weather, sport, cyber
 python -m scripts.check_topics
-python -m scaledatapipe.consumers.covid                  # runs until Ctrl+C
-python -m scaledatapipe.consumers.covid --available-now  # drains the topic, then exits
+python -m scaledatapipe.medallion.run --available-now   # Bronze + Silver under ./data
+python -m scripts.lake_report
 ```
 
-Outputs land in `$DATA_ROOT/outputs/<domain>/`, Spark checkpoints in
-`$DATA_ROOT/checkpoints/<domain>/`. Delete a domain's checkpoint to reprocess its
-topic from `STARTING_OFFSETS`.
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests
+```
+
+The Silver tests write Bronze-shaped Parquet and go through the real streaming
+path (`readStream` + `availableNow`), including watermark deduplication.
 
 ## Working from an exFAT drive (macOS)
 

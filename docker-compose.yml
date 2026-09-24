@@ -2,9 +2,9 @@ name: scaledatapipe
 
 # Kafka (KRaft) + HDFS + Spark standalone.
 #   docker compose up -d --build   (not --wait: kafka-init is a one-shot job)
-# Then run producers / scripts / Spark jobs through the "app" service, e.g.
-#   docker compose run --rm app python -m scaledatapipe.producers.weather
-#   docker compose run --rm app submit scaledatapipe/consumers/weather.py --available-now
+# "streaming" then continuously moves Kafka data into Bronze and Silver on HDFS.
+# Run producers / scripts / one-off Spark jobs through the "app" service, e.g.
+#   docker compose run --rm app python3 -m scaledatapipe.producers.weather
 
 x-spark-image: &spark-image
   image: scaledatapipe/spark:3.5.1
@@ -17,6 +17,7 @@ services:
   kafka:
     image: apache/kafka:3.9.1
     hostname: kafka
+    restart: unless-stopped
     ports:
       - "9092:9092" # host access (producers run from the local venv)
     environment:
@@ -58,6 +59,7 @@ services:
     platform: linux/amd64
     hostname: namenode
     command: ["hdfs", "namenode"]
+    restart: unless-stopped
     ports:
       - "9870:9870" # NameNode web UI
     env_file: docker/hadoop.env
@@ -76,6 +78,7 @@ services:
     platform: linux/amd64
     hostname: datanode
     command: ["hdfs", "datanode"]
+    restart: unless-stopped
     env_file: docker/hadoop.env
     volumes:
       - datanode:/data
@@ -95,6 +98,7 @@ services:
     <<: *spark-image
     hostname: spark-master
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    restart: unless-stopped
     ports:
       - "8080:8080" # Spark master web UI
     healthcheck:
@@ -107,11 +111,28 @@ services:
     <<: *spark-image
     hostname: spark-worker
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    restart: unless-stopped
     environment:
       SPARK_WORKER_CORES: "2"
       SPARK_WORKER_MEMORY: 1536m
     depends_on:
       spark-master: { condition: service_healthy }
+
+  # ---------------------------------------------------------------- Pipeline
+  # Long-running Medallion job: Kafka -> Bronze -> Silver (+ quarantine) on HDFS.
+  streaming:
+    <<: *spark-image
+    command: ["submit", "scaledatapipe/medallion/run.py"]
+    environment:
+      KAFKA_BOOTSTRAP: kafka:19092
+      DATA_ROOT: hdfs://namenode:8020/scaledatapipe
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      datanode: { condition: service_healthy }
+      # Restarted along with the master: its app would not survive a new master.
+      spark-master: { condition: service_healthy, restart: true }
+      spark-worker: { condition: service_started }
+    restart: unless-stopped
 
   # ---------------------------------------------------------------- Tools
   # One-off container for producers, scripts and spark-submit (not started by "up").

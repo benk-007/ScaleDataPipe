@@ -48,6 +48,16 @@ def checkpoint_path(domain: str) -> str:
     return f"{DATA_ROOT}/checkpoints/{domain}"
 
 
+# Medallion layers: {DATA_ROOT}/bronze/events, {DATA_ROOT}/silver/<domain>, ...
+def layer_path(layer: str, table: str) -> str:
+    return f"{DATA_ROOT}/{layer}/{table}"
+
+
+# Silver drops a duplicate only if it arrives within this window of the first
+# occurrence (bounded streaming state); Gold deduplicates fully in batch.
+SILVER_DEDUP_WINDOW = _env("SILVER_DEDUP_WINDOW", "7 days")
+
+
 # External sources
 NEWSAPI_KEY = _env("NEWSAPI_KEY")
 FOOTBALL_DATA_KEY = _env("FOOTBALL_DATA_KEY")

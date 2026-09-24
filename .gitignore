@@ -9,6 +9,7 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.pytest_cache/
 
 # Pipeline runtime data (outputs, Spark checkpoints, metastore)
 data/

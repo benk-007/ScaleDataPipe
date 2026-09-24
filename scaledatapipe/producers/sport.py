@@ -31,6 +31,12 @@ def fetch_events() -> list[dict]:
                     "home": m["homeTeam"]["name"],
                     "away": m["awayTeam"]["name"],
                     "status": m["status"],
+                    "match_id": m["id"],
+                    "competition_code": code,
+                    "utc_kickoff": m["utcDate"],
+                    "matchday": m.get("matchday"),
+                    "home_score": m["score"]["fullTime"]["home"],
+                    "away_score": m["score"]["fullTime"]["away"],
                 }
                 for m in matches
             ]

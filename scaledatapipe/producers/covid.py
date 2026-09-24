@@ -35,6 +35,9 @@ def fetch_events() -> list[dict]:
                         "source": "newsapi",
                         "title": a.get("title") or "",
                         "text": f"{a.get('title') or ''} {a.get('description') or ''}".strip(),
+                        "url": a.get("url"),
+                        "published_at": a.get("publishedAt"),
+                        "source_name": (a.get("source") or {}).get("name"),
                     }
                     for a in articles
                 ]
