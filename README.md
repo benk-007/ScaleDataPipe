@@ -13,6 +13,49 @@ producers and the Gold refresh every hour.
 | Sport   | [football-data.org](https://www.football-data.org) (key) | `sport_topic` |
 | Cyber   | [CISA KEV feed](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | `cyber_topic` |
 
+**Status:** validated end to end: a full Airflow run succeeded 6/6 tasks on the
+first attempt on an 8 GB laptop, with a documented memory reservation (see
+[Validation status](#validation-status)).
+
+| Layer          | Technology                                                   |
+|----------------|--------------------------------------------------------------|
+| Ingestion      | Python producers, Apache Kafka 3.9.1 (KRaft)                  |
+| Processing     | Apache Spark 3.5.1 Structured Streaming (Bronze, Silver), Spark batch (Gold) |
+| Storage        | HDFS 3.3.6, Parquet, Medallion layout                        |
+| Orchestration  | Apache Airflow 2.9.3 (LocalExecutor, Postgres 16)            |
+| Runtime        | Docker Compose; Python 3.10/3.11, Java 17                    |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph sources[Public APIs]
+        direction TB
+        news[NewsAPI]
+        meteo[Open-Meteo]
+        foot[football-data.org]
+        kev[CISA KEV]
+    end
+    kafka[(Kafka<br/>1 topic per domain)]
+    subgraph lake[HDFS data lake - Medallion]
+        direction LR
+        bronze[(Bronze<br/>raw events)] -->|typing, validation,<br/>deduplication| silver[(Silver<br/>clean tables)]
+        bronze -.->|invalid rows| quarantine[(Quarantine)]
+        silver -->|Spark batch<br/>Airflow build_gold| gold[(Gold<br/>aggregates)]
+    end
+    sources -->|producers<br/>Airflow, hourly| kafka
+    kafka -->|Spark Structured Streaming<br/>always on, exactly-once| bronze
+```
+
+1. Every hour, Airflow runs four **producers** that pull the public APIs and publish
+   JSON events to one **Kafka** topic per domain.
+2. A continuously running **Spark Structured Streaming** job copies every Kafka
+   record into **Bronze** (raw, exactly-once), then reads Bronze to build **Silver**:
+   typed, validated and deduplicated tables, with invalid rows sent to
+   **quarantine** instead of being dropped.
+3. A sensor waits until the streaming job has caught up with Kafka, then a Spark
+   batch job rebuilds the **Gold** aggregates from Silver.
+
 ## Layout
 
 ```
@@ -34,7 +77,8 @@ scripts/
 ├── init_env.py       # generates the Airflow secrets into .env
 ├── create_topics.py  # idempotent topic creation
 ├── check_topics.py   # message count + sample per topic
-└── lake_report.py    # row counts and reject reasons per lake table
+├── lake_report.py    # row counts and reject reasons per lake table
+└── e2e_test.py       # end-to-end test against a running stack
 tests/                # Silver/Gold logic (local Spark), producers, sensor, DAG
 docker/
 ├── spark/Dockerfile  # Spark 3.5.1 + baked-in Kafka connector + app code
@@ -77,7 +121,7 @@ default) rather than the start of the season: recent final scores plus upcoming
 fixtures. Keep the window wide enough to span international breaks.
 
 Silver deduplicates within `SILVER_DEDUP_WINDOW` (default 7 days) of the first
-occurrence, which keeps streaming state bounded; Gold will deduplicate fully.
+occurrence, which keeps streaming state bounded; Gold deduplicates fully.
 Sport keys include status and score so a match's progression (TIMED -> FINISHED)
 is kept.
 
@@ -85,7 +129,7 @@ is kept.
 
 | Table                   | Grain                    | Content                                                              |
 |-------------------------|--------------------------|----------------------------------------------------------------------|
-| `covid_daily`           | day                      | articles, articles mentioning "covid", mentions, share, sources      |
+| `covid_daily`           | day                      | articles, articles mentioning covid/coronavirus, mentions, share, sources |
 | `weather_city_daily`    | city, day                | observations, min/avg/max temperature, last reading, humidity, wind  |
 | `sport_matches`         | match                    | current state (latest status and score) and result                   |
 | `sport_team_stats`      | competition, team        | played, W/D/L, goals, goal difference, points (ingested matches only)|
@@ -232,21 +276,23 @@ Desktop after a session to give the memory back.
 
 ### Validation status
 
-Validated on a MacBook with 8 GB of RAM (Docker Desktop limited to 4.5 GB):
+The pipeline is validated end to end on a MacBook with 8 GB of RAM (Docker
+Desktop limited to 4.5 GB):
 
-- **Unit tests**: 22 in the local venv (Silver rules/typing/dedup and Gold
-  aggregates through Spark, producers, sensor logic) plus 3 DAG-structure tests
-  run in the Airflow image.
-- **End to end**: one full scheduled DAG run succeeded through the Airflow CLI:
-  6/6 tasks, Gold rebuilt its 5 tables on HDFS, 76 s. The stack was started stage
-  by stage under a memory watchdog.
-- **Memory**: that run stayed within the Docker limits above, but macOS swap usage
-  grew by 134 MB by its end, above the 100 MB threshold set for this validation.
-  The full stack is at the limit of an 8 GB machine; 16 GB is recommended to run
-  it comfortably.
-- **Airflow web UI**: not validated. Starting it next to the running pipeline
-  pushed macOS into swap on this machine: it needs more RAM than is available
-  here. The pipeline was validated through the CLI only.
+- **End to end: passed.** A full scheduled DAG run succeeded on the first attempt,
+  driven through the Airflow CLI: 6/6 tasks, Gold rebuilt its 5 tables on HDFS,
+  in 76 s. `scripts/e2e_test.py` packages the same checks for reuse (see Tests).
+- **Unit tests: passed.** 24 in the local venv plus 3 DAG-structure tests in the
+  Airflow image.
+- **Memory reservation.** Every container stayed within its limit: 3.06 GB peak
+  in total, at least 932 MB always available in the Docker VM, no swap inside it.
+  As an extra precaution we had capped macOS swap growth at 100 MB during the run;
+  it reached 134 MB, 34 MB over that self-imposed threshold, with no effect on the
+  pipeline. 8 GB of RAM is therefore the practical minimum; 16 GB is recommended
+  for comfortable use.
+- **Airflow web UI.** Available on demand (`--profile ui`), but on this 8 GB
+  machine it needs more RAM than can be spared next to the running pipeline, so
+  it was not validated here; the pipeline was operated through the CLI.
 
 ## Run locally (venv, without the cluster)
 
@@ -255,6 +301,8 @@ Requires Python 3.10 or 3.11 and Java 17. Kafka still comes from Docker.
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env              # fill in NEWSAPI_KEY and FOOTBALL_DATA_KEY
+python3 scripts/init_env.py       # compose needs the Airflow secrets, even for Kafka only
 docker compose up -d kafka kafka-init
 
 python -m scaledatapipe.producers.covid                  # likewise weather, sport, cyber
@@ -271,6 +319,16 @@ pip install -r requirements-dev.txt
 pytest tests
 ```
 
+End-to-end test against a running stack (standard library only, no JVM): it
+triggers a DAG run, waits for its 6 tasks and checks Bronze, Silver and Gold on
+HDFS, including that every Gold table was rebuilt by this run. It restores the
+DAG's paused state and exits non-zero on any failed check.
+
+```bash
+docker compose up -d
+python3 scripts/e2e_test.py
+```
+
 The Silver tests write Bronze-shaped Parquet and go through the real streaming
 path (`readStream` + `availableNow`), including watermark deduplication. The Gold
 tests cover latest-state selection, points, dedup and the table swap. The DAG
@@ -281,7 +339,16 @@ docker run --rm -v "$PWD":/src -w /src -e AIRFLOW__CORE__LOAD_EXAMPLES=false \
   scaledatapipe/airflow:2.9.3 bash -c "pip install -q pytest && python -m pytest -q -p no:cacheprovider tests/test_dag.py"
 ```
 
-## Working from an exFAT drive (macOS)
+## Versions
+
+`pyspark==3.5.1` bundles Scala 2.12, so the Kafka connector must be
+`spark-sql-kafka-0-10_2.12:3.5.1`. `common/spark.py` derives it from the installed
+PySpark, so upgrading PySpark alone keeps them consistent. The Docker image pins
+the same jars in `docker/spark/Dockerfile`: update both together.
+
+## Troubleshooting
+
+### Working from an exFAT drive (macOS)
 
 macOS stores file metadata in `._*` files on exFAT volumes, which breaks two things:
 
@@ -293,9 +360,6 @@ macOS stores file metadata in `._*` files on exFAT volumes, which breaks two thi
 
 Keeping the repository on an APFS disk avoids both.
 
-## Versions
+## License
 
-`pyspark==3.5.1` bundles Scala 2.12, so the Kafka connector must be
-`spark-sql-kafka-0-10_2.12:3.5.1`. `common/spark.py` derives it from the installed
-PySpark, so upgrading PySpark alone keeps them consistent. The Docker image pins
-the same jars in `docker/spark/Dockerfile`: update both together.
+[MIT](LICENSE)
