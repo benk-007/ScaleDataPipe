@@ -20,6 +20,7 @@ RUN pip3 install --no-cache-dir -r /tmp/requirements-base.txt
 
 COPY --chmod=755 docker/spark/submit.sh /usr/local/bin/submit
 COPY --chmod=755 docker/spark/submit-local.sh /usr/local/bin/submit-local
+COPY --chmod=755 docker/spark/submit-auto.sh /usr/local/bin/submit-auto
 COPY --chmod=755 scaledatapipe /opt/app/scaledatapipe
 COPY --chmod=755 scripts /opt/app/scripts
 

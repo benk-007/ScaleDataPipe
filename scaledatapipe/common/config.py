@@ -49,6 +49,10 @@ def layer_path(layer: str, table: str) -> str:
     return f"{DATA_ROOT}/{layer}/{table}"
 
 
+# WebHDFS endpoint, used to read streaming checkpoints without a JVM
+WEBHDFS_URL = _env("WEBHDFS_URL", "http://namenode:9870")
+
+
 # Silver drops a duplicate only if it arrives within this window of the first
 # occurrence (bounded streaming state); Gold deduplicates fully in batch.
 SILVER_DEDUP_WINDOW = _env("SILVER_DEDUP_WINDOW", "7 days")

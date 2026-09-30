@@ -71,7 +71,7 @@ def main():
                         help="Process everything currently available, then stop.")
     args = parser.parse_args()
 
-    spark = get_spark(f"Medallion-{args.layer}")
+    spark = get_spark(f"Medallion-{args.layer}", kafka=args.layer in ("bronze", "all"))
 
     bronze_query = None
     if args.layer in ("bronze", "all"):

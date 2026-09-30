@@ -1,8 +1,14 @@
 name: scaledatapipe
 
-# Kafka (KRaft) + HDFS + Spark standalone.
-#   docker compose up -d --build   (not --wait: kafka-init is a one-shot job)
-# "streaming" then continuously moves Kafka data into Bronze and Silver on HDFS.
+# Kafka (KRaft) + HDFS + Spark Structured Streaming + Airflow, sized for a 4.5 GB
+# Docker VM (see README "Memory budget").
+#   python3 scripts/init_env.py      # once: Airflow secrets in .env
+#   docker compose up -d --build     # not --wait: kafka-init / airflow-init are one-shot jobs
+# "streaming" continuously moves Kafka data into Bronze and Silver on HDFS (Spark
+# local mode); Airflow runs the producers and builds Gold every hour.
+# Optional profiles:
+#   --profile ui       Airflow web UI on http://localhost:8081
+#   --profile cluster  Spark standalone master/worker; set SPARK_MASTER_URL=spark://spark-master:7077
 # Run producers / scripts / one-off Spark jobs through the "app" service, e.g.
 #   docker compose run --rm app python3 -m scaledatapipe.producers.weather
 #   docker compose run --rm app submit-local scaledatapipe/medallion/gold.py
@@ -12,6 +18,33 @@ x-spark-image: &spark-image
   build:
     context: .
     dockerfile: docker/spark/Dockerfile
+
+x-airflow: &airflow
+  image: scaledatapipe/airflow:2.9.3
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  env_file:
+    - path: .env # API keys for the producers, admin password
+      required: false
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__PARALLELISM: "2"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?run scripts/init_env.py}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:?run scripts/init_env.py}@airflow-db/airflow
+    AIRFLOW__SCHEDULER__PARSING_PROCESSES: "1"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:?run scripts/init_env.py}
+    AIRFLOW__WEBSERVER__WORKERS: "1" # each gunicorn worker costs ~150 MB
+    AIRFLOW__WEBSERVER__WORKER_REFRESH_BATCH_SIZE: "0" # no rolling restarts (a transient extra worker)
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+    KAFKA_BOOTSTRAP: kafka:19092
+    DATA_ROOT: hdfs://namenode:8020/scaledatapipe
+    SPARK_DRIVER_MEMORY: 640m
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - airflow-logs:/opt/airflow/logs
 
 services:
   # ---------------------------------------------------------------- Kafka
@@ -107,6 +140,7 @@ services:
   # ---------------------------------------------------------------- Spark
   spark-master:
     <<: *spark-image
+    profiles: ["cluster"]
     hostname: spark-master
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
     restart: unless-stopped
@@ -123,6 +157,7 @@ services:
 
   spark-worker:
     <<: *spark-image
+    profiles: ["cluster"]
     hostname: spark-worker
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
     restart: unless-stopped
@@ -138,17 +173,22 @@ services:
   # Long-running Medallion job: Kafka -> Bronze -> Silver (+ quarantine) on HDFS.
   streaming:
     <<: *spark-image
-    command: ["submit", "scaledatapipe/medallion/run.py"]
-    mem_limit: 896m # driver: 512 MB heap + JVM/Python overhead
+    # Spark local mode (driver + executor in one 640 MB JVM) unless SPARK_MASTER_URL
+    # points at the optional cluster.
+    command: ["submit-auto", "scaledatapipe/medallion/run.py"]
+    mem_limit: 1152m
     environment:
       KAFKA_BOOTSTRAP: kafka:19092
       DATA_ROOT: hdfs://namenode:8020/scaledatapipe
+      SPARK_MASTER_URL: ${SPARK_MASTER_URL:-}
+      SPARK_DRIVER_MEMORY: 640m
     depends_on:
       kafka-init: { condition: service_completed_successfully }
       datanode: { condition: service_healthy }
-      # Restarted along with the master: its app would not survive a new master.
-      spark-master: { condition: service_healthy, restart: true }
-      spark-worker: { condition: service_started }
+      # Cluster profile only. Restarted along with the master: its app would not
+      # survive a new master.
+      spark-master: { condition: service_healthy, restart: true, required: false }
+      spark-worker: { condition: service_started, required: false }
     restart: unless-stopped
 
   # ---------------------------------------------------------------- Tools
@@ -166,9 +206,71 @@ services:
     depends_on:
       kafka-init: { condition: service_completed_successfully }
       datanode: { condition: service_healthy }
-      spark-worker: { condition: service_started }
+      spark-worker: { condition: service_started, required: false }
+
+  # ---------------------------------------------------------------- Airflow
+  airflow-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    mem_limit: 192m
+    command: ["postgres", "-c", "shared_buffers=16MB", "-c", "max_connections=40"]
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:?run scripts/init_env.py}
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 12
+
+  airflow-init:
+    <<: *airflow
+    restart: "no"
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow pools set spark 1 "Spark jobs: one at a time (memory budget)"
+        airflow users list | grep -qw admin || airflow users create --role Admin --username admin \
+          --password "$$AIRFLOW_ADMIN_PASSWORD" --firstname Admin --lastname User --email admin@example.invalid
+    depends_on:
+      airflow-db: { condition: service_healthy }
+
+  airflow-scheduler:
+    <<: *airflow
+    restart: unless-stopped
+    command: scheduler
+    # Scheduler + LocalExecutor task processes, incl. the Gold Spark job (640 MB heap).
+    mem_limit: 1536m
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+      kafka-init: { condition: service_completed_successfully }
+      datanode: { condition: service_healthy }
+
+  # Web UI on demand: docker compose --profile ui up -d airflow-webserver
+  airflow-webserver:
+    <<: *airflow
+    profiles: ["ui"]
+    restart: unless-stopped
+    command: webserver
+    mem_limit: 640m
+    ports:
+      - "8081:8080"
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
 
 volumes:
   kafka:
   namenode:
   datanode:
+  airflow-db:
+  airflow-logs:

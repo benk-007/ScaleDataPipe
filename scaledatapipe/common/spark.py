@@ -35,13 +35,15 @@ def kafka_package() -> str | None:
     return f"org.apache.spark:spark-sql-kafka-0-10_{scala_binary}:{pyspark.__version__}"
 
 
-def get_spark(app_name: str) -> SparkSession:
+def get_spark(app_name: str, kafka: bool = False) -> SparkSession:
+    """SparkSession in UTC. Only jobs reading Kafka need the connector (kafka=True):
+    outside the Spark image it is fetched from Maven, which batch jobs should avoid."""
     builder = (
         SparkSession.builder.appName(app_name)
         .config("spark.sql.shuffle.partitions", "4")
         .config("spark.sql.session.timeZone", "UTC")
     )
-    package = kafka_package()
+    package = kafka_package() if kafka else None
     if package:
         builder = builder.config("spark.jars.packages", package)
     spark = builder.getOrCreate()
