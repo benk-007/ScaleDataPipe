@@ -2,7 +2,8 @@
 
 Real-time data pipeline: Python producers pull four public sources into Apache Kafka,
 and a Spark Structured Streaming job lands them in a Medallion lake on HDFS
-(Bronze raw copy -> Silver typed, validated and deduplicated tables).
+(Bronze raw copy -> Silver typed, validated and deduplicated tables), from which
+a batch job builds Gold business aggregates.
 
 | Domain  | Source                                   | Kafka topic     |
 |---------|------------------------------------------|-----------------|
@@ -11,8 +12,7 @@ and a Spark Structured Streaming job lands them in a Medallion lake on HDFS
 | Sport   | [football-data.org](https://www.football-data.org) (key) | `sport_topic` |
 | Cyber   | [CISA KEV feed](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | `cyber_topic` |
 
-> Work in progress: the Gold layer (business aggregates) and Airflow
-> orchestration are the next milestones.
+> Work in progress: Airflow orchestration is the next milestone.
 
 ## Layout
 
@@ -25,13 +25,13 @@ scaledatapipe/
 ├── medallion/
 │   ├── bronze.py     # Kafka -> Bronze (raw records + Kafka coordinates)
 │   ├── silver.py     # Bronze -> Silver / quarantine, per-domain rules
-│   └── run.py        # streaming entry point (both layers, supervised)
-└── consumers/        # legacy per-topic CSV consumers (replaced by Gold in Lot 4)
+│   ├── run.py        # streaming entry point (both layers, supervised)
+│   └── gold.py       # Silver -> Gold aggregates (batch)
 scripts/
 ├── create_topics.py  # idempotent topic creation
 ├── check_topics.py   # message count + sample per topic
 └── lake_report.py    # row counts and reject reasons per lake table
-tests/                # Silver rules, typing and dedup (local Spark)
+tests/                # Silver rules/typing/dedup and Gold aggregates (local Spark)
 docker/
 ├── spark/Dockerfile  # Spark 3.5.1 + baked-in Kafka connector + app code
 ├── spark/submit.sh   # spark-submit wrapper for the standalone cluster
@@ -48,6 +48,7 @@ Everything lives under `DATA_ROOT` (`hdfs://namenode:8020/scaledatapipe` in Dock
 | `bronze/events`          | every Kafka record, untouched JSON + topic/partition/offset | `topic`, `ingest_date`  |
 | `silver/<domain>`        | typed business columns + Kafka lineage, deduplicated        | `event_date`            |
 | `quarantine/<domain>`    | rows failing validation: raw value + `reject_reason`        | `ingest_date`           |
+| `gold/<table>`           | business aggregates, rebuilt from Silver on each run        |                         |
 | `checkpoints/<query>`    | Structured Streaming state                                  |                         |
 
 - **Bronze** is append-only and exactly-once (Parquet file sink + checkpoint), so
@@ -68,6 +69,22 @@ Silver deduplicates within `SILVER_DEDUP_WINDOW` (default 7 days) of the first
 occurrence, which keeps streaming state bounded; Gold will deduplicate fully.
 Sport keys include status and score so a match's progression (TIMED -> FINISHED)
 is kept.
+
+### Gold tables
+
+| Table                   | Grain                    | Content                                                              |
+|-------------------------|--------------------------|----------------------------------------------------------------------|
+| `covid_daily`           | day                      | articles, articles mentioning "covid", mentions, share, sources      |
+| `weather_city_daily`    | city, day                | observations, min/avg/max temperature, last reading, humidity, wind  |
+| `sport_matches`         | match                    | current state (latest status and score) and result                   |
+| `sport_team_stats`      | competition, team        | played, W/D/L, goals, goal difference, points (ingested matches only)|
+| `cyber_vendor_exposure` | vendor                   | CVEs, ransomware-linked CVEs, products, first/last added, next due   |
+
+Gold is a batch job: each run recomputes every table from the whole of Silver,
+first keeping the latest record per business key (Silver only deduplicates within
+its window), so reruns are idempotent. Each table is written to a temporary
+directory, then swapped in. Every row carries the run's `computed_at` (UTC). The
+job exits with an error when no Silver data exists at all.
 
 ## Run with Docker (recommended)
 
@@ -90,7 +107,8 @@ docker compose up -d --build          # not --wait: kafka-init is a one-shot job
 docker compose run --rm app python3 -m scaledatapipe.producers.covid   # likewise weather, sport, cyber
 docker compose run --rm app python3 -m scripts.check_topics
 
-# The streaming service picks the events up within seconds
+# The streaming service picks the events up within seconds; then build Gold
+docker compose run --rm app submit scaledatapipe/medallion/gold.py
 docker compose run --rm app submit scripts/lake_report.py
 docker compose exec namenode hdfs dfs -ls /scaledatapipe/silver
 
@@ -135,6 +153,7 @@ docker compose up -d kafka kafka-init
 python -m scaledatapipe.producers.covid                  # likewise weather, sport, cyber
 python -m scripts.check_topics
 python -m scaledatapipe.medallion.run --available-now   # Bronze + Silver under ./data
+python -m scaledatapipe.medallion.gold                   # Gold
 python -m scripts.lake_report
 ```
 
@@ -146,7 +165,8 @@ pytest tests
 ```
 
 The Silver tests write Bronze-shaped Parquet and go through the real streaming
-path (`readStream` + `availableNow`), including watermark deduplication.
+path (`readStream` + `availableNow`), including watermark deduplication. The Gold
+tests cover latest-state selection, points, dedup and the table swap.
 
 ## Working from an exFAT drive (macOS)
 

@@ -21,6 +21,7 @@ from pyspark.sql.types import (
 )
 
 from scaledatapipe.common import config
+from scaledatapipe.common.spark import with_trigger
 from scaledatapipe.medallion import bronze
 
 LINEAGE = ["topic", "partition", "offset", "kafka_ts"]
@@ -233,11 +234,7 @@ def _start(df: DataFrame, name: str, out: str, partition: str, available_now: bo
         .partitionBy(partition)
         .outputMode("append")
     )
-    if available_now:
-        writer = writer.trigger(availableNow=True)
-    else:
-        writer = writer.trigger(processingTime=config.TRIGGER_INTERVAL)
-    return writer.start()
+    return with_trigger(writer, available_now).start()
 
 
 def start(spark: SparkSession, available_now: bool) -> list:

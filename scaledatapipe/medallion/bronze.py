@@ -18,6 +18,7 @@ from pyspark.sql.types import (
 )
 
 from scaledatapipe.common import config
+from scaledatapipe.common.spark import with_trigger
 
 TABLE = "events"
 
@@ -73,11 +74,7 @@ def start(spark: SparkSession, available_now: bool):
         .partitionBy("topic", "ingest_date")
         .outputMode("append")
     )
-    if available_now:
-        writer = writer.trigger(availableNow=True)
-    else:
-        writer = writer.trigger(processingTime=config.TRIGGER_INTERVAL)
-    return writer.start()
+    return with_trigger(writer, available_now).start()
 
 
 def read_stream(spark: SparkSession) -> DataFrame:

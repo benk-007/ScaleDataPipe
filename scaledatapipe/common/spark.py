@@ -1,13 +1,11 @@
-"""Spark helpers shared by all consumers."""
-import argparse
+"""Spark helpers shared by the Medallion jobs."""
 import os
 import re
 from pathlib import Path
 
 import pyspark
+from pyspark.errors import AnalysisException
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.types import StructType
 
 from scaledatapipe.common import config
 
@@ -51,43 +49,11 @@ def get_spark(app_name: str) -> SparkSession:
     return spark
 
 
-def read_topic(spark: SparkSession, topic: str, schema: StructType) -> DataFrame:
-    """Stream a Kafka topic and parse its JSON values with `schema`."""
-    raw = (
-        spark.readStream.format("kafka")
-        .option("kafka.bootstrap.servers", config.KAFKA_BOOTSTRAP)
-        .option("subscribe", topic)
-        .option("startingOffsets", config.STARTING_OFFSETS)
-        .option("failOnDataLoss", "false")
-        .load()
-    )
-    return (
-        raw.select(F.from_json(F.col("value").cast("string"), schema).alias("obj"))
-        .select("obj.*")
-    )
-
-
-def parse_args(description: str) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument(
-        "--available-now",
-        action="store_true",
-        help="Process everything currently in the topic, then stop (instead of running forever).",
-    )
-    return parser.parse_args()
-
-
-def start(df: DataFrame, domain: str, process_batch, available_now: bool):
-    """Start the streaming query writing through `process_batch`, then block."""
-    writer = df.writeStream.foreachBatch(process_batch).option(
-        "checkpointLocation", config.checkpoint_path(domain)
-    )
+def with_trigger(writer, available_now: bool):
+    """availableNow drains what is there and stops; otherwise micro-batch forever."""
     if available_now:
-        writer = writer.trigger(availableNow=True)
-    else:
-        writer = writer.trigger(processingTime=config.TRIGGER_INTERVAL)
-    query = writer.start()
-    query.awaitTermination()
+        return writer.trigger(availableNow=True)
+    return writer.trigger(processingTime=config.TRIGGER_INTERVAL)
 
 
 def _hadoop_path(spark: SparkSession, path: str):
@@ -102,7 +68,23 @@ def path_exists(spark: SparkSession, path: str) -> bool:
     return fs.exists(hpath)
 
 
-def append_csv(batch_df: DataFrame, domain: str) -> None:
-    batch_df.coalesce(1).write.mode("append").option("header", True).csv(
-        config.output_path(domain)
-    )
+def read_parquet(spark: SparkSession, path: str) -> DataFrame | None:
+    """Parquet table, or None if missing or still empty (no data file committed yet)."""
+    if not path_exists(spark, path):
+        return None
+    try:
+        return spark.read.parquet(path)
+    except AnalysisException:  # e.g. only _spark_metadata so far: no schema to infer
+        return None
+
+
+def replace_dir(spark: SparkSession, src: str, dst: str) -> None:
+    """Move src onto dst, replacing it. Readers only ever see the old or the new
+    table, apart from the instant between the delete and the rename."""
+    fs, src_path = _hadoop_path(spark, src)
+    _, dst_path = _hadoop_path(spark, dst)
+    if fs.exists(dst_path) and not fs.delete(dst_path, True):
+        raise IOError(f"Could not delete {dst}")
+    if not fs.rename(src_path, dst_path):
+        raise IOError(f"Could not rename {src} to {dst}")
+

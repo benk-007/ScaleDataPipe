@@ -24,11 +24,11 @@ TOPIC_SPORT = "sport_topic"
 TOPIC_CYBER = "cyber_topic"
 TOPICS = [TOPIC_COVID, TOPIC_WEATHER, TOPIC_SPORT, TOPIC_CYBER]
 
-# Spark consumers
+# Streaming jobs
 STARTING_OFFSETS = _env("STARTING_OFFSETS", "earliest")
 TRIGGER_INTERVAL = _env("TRIGGER_INTERVAL", "5 seconds")
 
-# Outputs and checkpoints (one folder per domain).
+# Root of the data lake and checkpoints.
 # Either a local path or a URI such as hdfs://namenode:8020/scaledatapipe
 def _resolve_data_root(value: str) -> str:
     if "://" in value:
@@ -40,12 +40,8 @@ def _resolve_data_root(value: str) -> str:
 DATA_ROOT = _resolve_data_root(_env("DATA_ROOT", str(REPO_ROOT / "data")))
 
 
-def output_path(domain: str) -> str:
-    return f"{DATA_ROOT}/outputs/{domain}"
-
-
-def checkpoint_path(domain: str) -> str:
-    return f"{DATA_ROOT}/checkpoints/{domain}"
+def checkpoint_path(query: str) -> str:
+    return f"{DATA_ROOT}/checkpoints/{query}"
 
 
 # Medallion layers: {DATA_ROOT}/bronze/events, {DATA_ROOT}/silver/<domain>, ...
