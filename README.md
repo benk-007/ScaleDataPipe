@@ -61,6 +61,12 @@ Everything lives under `DATA_ROOT` (`hdfs://namenode:8020/scaledatapipe` in Dock
 | Domain  | Business key (dedup)                         | Rejected when                                               |
 |---------|----------------------------------------------|-------------------------------------------------------------|
 | covid   | `article_id` (hash of URL, or title)         | no title, no date                                           |
+
+`covid_mentions` counts the words `covid`, `covid19` and `coronavirus` (so
+"COVID-19" counts once, as "covid"). The sport producer fetches the matches
+between `SPORT_DAYS_BACK` days ago and `SPORT_DAYS_AHEAD` days ahead (14/14 by
+default) rather than the start of the season: recent final scores plus upcoming
+fixtures. Keep the window wide enough to span international breaks.
 | weather | `city`, `observed_at`                        | no city/time, temperature, humidity or wind out of range    |
 | sport   | `match_id`, `status`, scores                 | no id/kickoff/team, unknown status, finished without score  |
 | cyber   | `cve_id`                                     | malformed CVE id, no `date_added`                           |
@@ -108,8 +114,8 @@ docker compose run --rm app python3 -m scaledatapipe.producers.covid   # likewis
 docker compose run --rm app python3 -m scripts.check_topics
 
 # The streaming service picks the events up within seconds; then build Gold
-docker compose run --rm app submit scaledatapipe/medallion/gold.py
-docker compose run --rm app submit scripts/lake_report.py
+docker compose run --rm app submit-local scaledatapipe/medallion/gold.py
+docker compose run --rm app submit-local scripts/lake_report.py
 docker compose exec namenode hdfs dfs -ls /scaledatapipe/silver
 
 docker compose down        # keeps Kafka and HDFS data (add -v to wipe it)
@@ -123,6 +129,10 @@ resumes from its checkpoints. Compose also restarts it whenever it restarts the
 Spark master. After rebuilding the image, run `docker compose up -d` so every
 service picks it up.
 
+`submit` sends a job to the Spark cluster; `submit-local` runs it in a single
+JVM inside the `app` container, which is what short batch jobs (Gold, reports)
+use so the worker stays dedicated to the streaming job.
+
 To process the lake in batch instead (e.g. to rebuild it), stop the service first:
 two jobs must never share the same checkpoints.
 
@@ -130,16 +140,46 @@ two jobs must never share the same checkpoints.
 docker compose stop streaming
 docker compose run --rm app submit scaledatapipe/medallion/run.py --available-now
 docker compose start streaming
+```
+
+To rebuild one Silver domain from Bronze (e.g. after changing its rules), delete
+its tables and checkpoints while the service is stopped; the job then replays
+the whole of Bronze for that domain:
+
+```bash
+docker compose stop streaming
+docker compose exec namenode hdfs dfs -rm -r /scaledatapipe/silver/covid /scaledatapipe/quarantine/covid \
+  /scaledatapipe/checkpoints/silver_covid /scaledatapipe/checkpoints/quarantine_covid
+docker compose start streaming
 ``` The Kafka
 connector jars are part of the image (checksum-pinned), so jobs never download
 from Maven at runtime. API keys come from `.env` at run time and are never
 copied into the image (see `.dockerignore`).
 
-Resources: about 1.6 GB of RAM for the infrastructure, plus about 1.5 GB for the
-streaming job; each Spark app takes 1 core and 768 MB of executor memory, so one
-more job can run next to it. The
-HDFS images are amd64-only and run emulated on Apple Silicon, which is slower
-to start but works.
+### Memory budget (6 GB Docker Desktop)
+
+The stack is sized for a Docker VM with 6 GB of RAM (8 GB laptop). Every JVM has
+an explicit heap and every container a hard `mem_limit`, set 25-50% above the
+peak measured under load (producers + streaming + a Gold job):
+
+| Service        | JVM heap         | Measured peak | `mem_limit` |
+|----------------|------------------|---------------|-------------|
+| kafka          | 256 MB           | 440 MB        | 576 MB      |
+| namenode       | 256 MB           | 466 MB        | 640 MB      |
+| datanode       | 192 MB           | 762 MB*       | 768 MB      |
+| spark-master   | 192 MB           | 215 MB        | 320 MB      |
+| spark-worker   | 192 MB + 512 MB executor | 793 MB | 1024 MB    |
+| streaming      | 512 MB driver    | 685 MB        | 896 MB      |
+| app (Gold)     | 640 MB, local    | 657 MB        | 1152 MB     |
+
+\* includes page cache from block writes, which the kernel reclaims first.
+
+All containers together peaked at 3.75 GB (4.7 GB before the heaps were
+bounded), leaving about 1.7 GB before the VM would touch swap. The worker only
+offers room for one executor, so an extra cluster job waits rather than
+overcommitting memory; run batch jobs with `submit-local`. The HDFS images are
+amd64-only and run emulated on Apple Silicon, which adds JVM overhead and slows
+their start-up.
 
 ## Run locally (venv, without the cluster)
 

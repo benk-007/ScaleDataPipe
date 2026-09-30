@@ -105,9 +105,12 @@ def test_covid_mentions_and_fallback_ids(spark, tmp_path):
                "published_at": "2026-09-23T08:00:00Z", "source_name": "Example"}
     fallback = {"date": "2026-09-24", "source": "fallback", "title": "new covid variant reported",
                 "text": "new covid variant reported"}
-    rows = valid(spark, tmp_path, silver.COVID, [article, article, fallback, {**article, "title": ""}])
-    assert len(rows) == 2  # duplicate dropped, empty title rejected
+    corona = {**article, "url": "https://example.org/b", "title": "Coronavirus wave",
+              "text": "Coronavirus wave: coronavirus cases up, new COVID19 wing, coronaviruses studied"}
+    rows = valid(spark, tmp_path, silver.COVID, [article, article, fallback, {**article, "title": ""}, corona])
+    assert len(rows) == 3  # duplicate dropped, empty title rejected
     assert rows[0].covid_mentions == 2  # "covid", "covid-19" -> "covid 19"; not "covidiots"
+    assert rows[2].covid_mentions == 3  # 2 x "coronavirus" + "covid19"; not "coronaviruses"
     assert str(rows[0].event_date) == "2026-09-23"  # published date wins over ingestion date
     assert rows[1].origin == "fallback" and rows[1].article_id is not None
 

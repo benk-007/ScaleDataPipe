@@ -57,3 +57,8 @@ SILVER_DEDUP_WINDOW = _env("SILVER_DEDUP_WINDOW", "7 days")
 # External sources
 NEWSAPI_KEY = _env("NEWSAPI_KEY")
 FOOTBALL_DATA_KEY = _env("FOOTBALL_DATA_KEY")
+
+# Sport producer: matches fetched in [today - BACK, today + AHEAD]. Fixture
+# breaks (international windows) can leave a narrower window empty.
+SPORT_DAYS_BACK = int(_env("SPORT_DAYS_BACK", "14"))
+SPORT_DAYS_AHEAD = int(_env("SPORT_DAYS_AHEAD", "14"))

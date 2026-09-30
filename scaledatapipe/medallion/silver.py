@@ -45,6 +45,11 @@ class Domain:
     keys: list[str]
 
 
+# Words counted as COVID mentions. "COVID-19" splits into "covid" + "19";
+# "covid19" is its hyphen-less spelling.
+COVID_TERMS = ["covid", "covid19", "coronavirus"]
+
+
 def _words(text: Column) -> Column:
     return F.split(F.regexp_replace(F.lower(text), r"[^a-z0-9\s]", " "), r"\s+")
 
@@ -70,7 +75,8 @@ COVID = Domain(
         "source_name": F.coalesce(o.source_name, o.source),
         "origin": o.source,  # "newsapi" or "fallback"
         "published_at": F.to_timestamp(o.published_at),
-        "covid_mentions": F.size(F.filter(_words(F.coalesce(o.text, F.lit(""))), lambda w: w == "covid")),
+        "covid_mentions": F.size(F.filter(_words(F.coalesce(o.text, F.lit(""))),
+                                          lambda w: w.isin(*COVID_TERMS))),
         "event_date": F.coalesce(F.to_date(F.to_timestamp(o.published_at)), F.to_date(o.date)),
     },
     rules=lambda: [

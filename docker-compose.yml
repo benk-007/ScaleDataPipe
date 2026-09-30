@@ -5,6 +5,7 @@ name: scaledatapipe
 # "streaming" then continuously moves Kafka data into Bronze and Silver on HDFS.
 # Run producers / scripts / one-off Spark jobs through the "app" service, e.g.
 #   docker compose run --rm app python3 -m scaledatapipe.producers.weather
+#   docker compose run --rm app submit-local scaledatapipe/medallion/gold.py
 
 x-spark-image: &spark-image
   image: scaledatapipe/spark:3.5.1
@@ -18,6 +19,7 @@ services:
     image: apache/kafka:3.9.1
     hostname: kafka
     restart: unless-stopped
+    mem_limit: 576m
     ports:
       - "9092:9092" # host access (producers run from the local venv)
     environment:
@@ -35,6 +37,7 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xmx256m -Xms256m # image default is 1 GB
     volumes:
       - kafka:/var/lib/kafka/data
     healthcheck:
@@ -60,11 +63,13 @@ services:
     hostname: namenode
     command: ["hdfs", "namenode"]
     restart: unless-stopped
+    mem_limit: 640m
     ports:
       - "9870:9870" # NameNode web UI
     env_file: docker/hadoop.env
     environment:
       ENSURE_NAMENODE_DIR: /data/namenode # formatted on first start only
+      HADOOP_HEAPSIZE_MAX: 256m # JVM default would be 1/4 of the VM's RAM
     volumes:
       - namenode:/data
     healthcheck:
@@ -79,19 +84,25 @@ services:
     hostname: datanode
     command: ["hdfs", "datanode"]
     restart: unless-stopped
+    mem_limit: 768m # includes page cache of block writes (reclaimed first)
     env_file: docker/hadoop.env
+    environment:
+      HADOOP_HEAPSIZE_MAX: 192m # also caps the healthcheck's hdfs CLI JVM
     volumes:
       - datanode:/data
     depends_on:
       namenode: { condition: service_started } # datanode retries until the namenode is up
     # Healthy = HDFS writable. After a restart the namenode stays in safe mode
     # until this datanode reports its blocks; writes fail until then.
+    # Each check starts an hdfs CLI JVM (costly under emulation): frequent while
+    # starting up, then once a minute.
     healthcheck:
       test: ["CMD-SHELL", "hdfs dfsadmin -safemode get 2>/dev/null | grep -q OFF"]
-      interval: 10s
+      interval: 60s
       timeout: 60s # hdfs CLI JVM starts slowly under amd64 emulation
-      start_period: 30s
-      retries: 18
+      start_period: 180s
+      start_interval: 10s
+      retries: 3
 
   # ---------------------------------------------------------------- Spark
   spark-master:
@@ -99,6 +110,9 @@ services:
     hostname: spark-master
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
     restart: unless-stopped
+    mem_limit: 320m
+    environment:
+      SPARK_DAEMON_MEMORY: 192m # default 1 GB
     ports:
       - "8080:8080" # Spark master web UI
     healthcheck:
@@ -112,9 +126,11 @@ services:
     hostname: spark-worker
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
     restart: unless-stopped
+    mem_limit: 1024m # worker daemon + the streaming executor
     environment:
+      SPARK_DAEMON_MEMORY: 192m # the worker daemon itself; default 1 GB
       SPARK_WORKER_CORES: "2"
-      SPARK_WORKER_MEMORY: 1536m
+      SPARK_WORKER_MEMORY: 512m # room for exactly one 512 MB executor (the streaming job)
     depends_on:
       spark-master: { condition: service_healthy }
 
@@ -123,6 +139,7 @@ services:
   streaming:
     <<: *spark-image
     command: ["submit", "scaledatapipe/medallion/run.py"]
+    mem_limit: 896m # driver: 512 MB heap + JVM/Python overhead
     environment:
       KAFKA_BOOTSTRAP: kafka:19092
       DATA_ROOT: hdfs://namenode:8020/scaledatapipe
@@ -139,6 +156,7 @@ services:
   app:
     <<: *spark-image
     profiles: ["tools"]
+    mem_limit: 1152m # submit-local jobs: 640 MB heap + JVM/Python overhead
     env_file:
       - path: .env
         required: false
